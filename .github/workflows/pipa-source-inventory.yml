@@ -1,0 +1,97 @@
+name: Pipa UEFI Source Inventory
+
+on:
+  workflow_dispatch:
+    inputs:
+      REF:
+        description: "Branch, tag, or commit to inspect"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Mu-Qcom without initializing submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.REF }}
+          submodules: false
+          fetch-depth: 1
+
+      - name: Inventory tracked paths and submodule references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit
+          git rev-parse HEAD > audit/commit.txt
+          git ls-tree -r --full-tree HEAD > audit/git-tree.txt
+          if [ -f .gitmodules ]; then
+            cp .gitmodules audit/gitmodules.txt
+          else
+            printf 'No .gitmodules file at this revision.\n' > audit/gitmodules.txt
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          rows = subprocess.check_output(
+              ["git", "ls-tree", "-r", "--full-tree", "HEAD"],
+              text=True
+          ).splitlines()
+
+          paths = []
+          submodules = []
+          for row in rows:
+              meta, path = row.split("\t", 1)
+              mode, kind, obj = meta.split()
+              paths.append(path)
+              if mode == "160000" or kind == "commit":
+                  submodules.append((path, obj))
+
+          def matches(path):
+              p = path.lower()
+              terms = ("pipa", "acpi", "dtb", "bootshim", "platformbuild.py",
+                       "configs/", "platforms/", "image", "ufs", "display",
+                       "sm8250", "kona", "arm")
+              return any(term in p for term in terms)
+
+          out = [
+              "# Mu-Qcom tracked source inventory",
+              "",
+              f"- Commit: `{subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()}`",
+              f"- Tracked paths: {len(paths)}",
+              f"- Git submodule references: {len(submodules)}",
+              "",
+              "## Relevant paths (keyword-filtered; not a complete source listing)",
+              ""
+          ]
+          out.extend(f"- `{p}`" for p in paths if matches(p))
+          out += ["", "## Submodule gitlinks", ""]
+          if submodules:
+              out.extend(f"- `{p}` → `{sha}`" for p, sha in submodules)
+          else:
+              out.append("- No gitlinks found in the tracked tree.")
+          out += [
+              "",
+              "## Notes",
+              "",
+              "- This workflow only reads repository metadata and tracked paths.",
+              "- It does not build firmware, download submodule contents, or flash a device.",
+              "- A gitlink records a submodule commit, not the contents of that submodule.",
+              "- Keyword filtering is a navigation aid; inspect the full `git-tree.txt` before concluding a file is absent."
+          ]
+          Path("audit/source-inventory.md").write_text("\n".join(out) + "\n")
+          PY
+
+      - name: Upload inventory artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mu-qcom-source-inventory
+          path: audit/
+          if-no-files-found: error
+          retention-days: 14
