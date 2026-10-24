@@ -16,12 +16,155 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout Mu-Qcom and initialize pinned submodules
+      - name: Checkout Mu-Qcom without recursive submodules
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.REF }}
-          submodules: recursive
+          submodules: false
           fetch-depth: 1
+
+      - name: Initialize direct submodules individually (do not recurse)
+        shell: bash
+        run: |
+          set -u
+          mkdir -p audit
+          : > audit/submodule-init.log
+          if [ ! -f .gitmodules ]; then
+            echo "No .gitmodules file at this revision." | tee -a audit/submodule-init.log
+            exit 0
+          fi
+          while read -r key path; do
+            [ -n "${path:-}" ] || continue
+            echo "=== Initializing direct submodule: $path ===" | tee -a audit/submodule-init.log
+            if git -c submodule.recurse=false submodule update --init --depth 1 -- "$path" >> audit/submodule-init.log 2>&1; then
+              echo "RESULT: initialized $path" | tee -a audit/submodule-init.log
+            else
+              code=$?
+              echo "RESULT: FAILED ($code): $path; continuing audit without recursive initialization" | tee -a audit/submodule-init.log
+            fi
+          done < <(git config -f .gitmodules --get-regexp '^submodule\\..*\\.path        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit
+          git rev-parse HEAD > audit/commit.txt
+          git submodule status --recursive > audit/submodule-status.txt || true
+          git status --short --branch > audit/worktree-status.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import subprocess
+
+          root = Path(".")
+          required = [
+              ".gitmodules",
+              "build_uefi.sh",
+              "setup_env.sh",
+              "BootShim/Makefile",
+              "configs/pipa.conf",
+              "configs/pipa.sh",
+              "Platforms/Xiaomi/pipaPkg/PlatformBuild.py",
+              "Platforms/Xiaomi/pipaPkg/pipa.dsc",
+              "Platforms/Xiaomi/pipaPkg/pipa.fdf",
+              "Platforms/Xiaomi/pipaPkg/Include/ACPI.inc",
+              "Platforms/Xiaomi/pipaPkg/AcpiTables/DSDT.dsl",
+              "Platforms/Xiaomi/pipaPkg/Library/DeviceConfigurationMapLib/DeviceConfigurationMapLib.c",
+              "Platforms/Xiaomi/pipaPkg/Library/DeviceMemoryMapLib/DeviceMemoryMapLib.c",
+              "ImageResources/DTBs/pipa.dtb",
+              "ImageResources/DTBs/pipa.dts",
+              "ImageResources/mkbootimg.py",
+              "ImageResources/ramdisk",
+              "Binaries",
+              "Common/Mu",
+              "Common/Mu_OEM_Sample",
+              "Common/Mu_Tiano_Plus",
+              "Features/DFCI",
+              "Mu_Basecore",
+              "Silicon/Arm/Mu_Tiano",
+          ]
+
+          lines = [
+              "# Pipa UEFI dependency and input audit",
+              "",
+              f"- Commit: `{subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()}`",
+              "- Mode: read-only source/dependency audit; no firmware build or flashing",
+              "",
+              "## Required path checks",
+              "",
+              "| Path | Status | Size | SHA-256 (files only) |",
+              "|---|---|---:|---|",
+          ]
+          for name in required:
+              p = root / name
+              if not p.exists():
+                  status, size, digest = "MISSING", "-", "-"
+              elif p.is_file():
+                  data = p.read_bytes()
+                  status = "PRESENT"
+                  size = str(len(data))
+                  digest = hashlib.sha256(data).hexdigest()
+              elif p.is_dir():
+                  status, size, digest = "PRESENT (directory)", "-", "-"
+              else:
+                  status, size, digest = "PRESENT (other)", "-", "-"
+              lines.append(f"| `{name}` | {status} | {size} | {digest} |")
+
+          lines += ["", "## Git submodule state", ""]
+          try:
+              status = subprocess.check_output(
+                  ["git", "submodule", "status", "--recursive"],
+                  text=True, stderr=subprocess.STDOUT
+              ).splitlines()
+          except subprocess.CalledProcessError as e:
+              status = e.output.splitlines()
+          if status:
+              lines.extend(f"- `{row}`" for row in status)
+          else:
+              lines.append("- No submodule status lines returned.")
+
+          lines += [
+              "",
+              "## Build-script references",
+              "",
+          ]
+          for name in ["build_uefi.sh", "configs/pipa.sh", "Platforms/Xiaomi/pipaPkg/PlatformBuild.py"]:
+              p = root / name
+              lines.append(f"### `{name}`")
+              if not p.is_file():
+                  lines.append("- File unavailable; references not scanned.")
+                  continue
+              matches = []
+              for i, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
+                  low = line.lower()
+                  if any(term in low for term in (
+                      "submodule", "setup", "requirements", "pip", "iasl",
+                      "clang", "bootshim", "dtb", "ramdisk", "mkbootimg",
+                      "package", "toolchain", "feature_config_path"
+                  )):
+                      matches.append(f"- L{i}: `{line.strip()[:240]}`")
+              lines.extend(matches or ["- No matching build/dependency references found."])
+              lines.append("")
+
+          lines += [
+              "## Interpretation notes",
+              "",
+              "- A present path does not establish that its contents are valid for the device.",
+              "- Submodule state records the checked-out revisions; this audit does not compile code.",
+              "- Missing files, empty files, and uninitialized submodules should be resolved before a build is attempted.",
+              "- No output image is produced and no device is modified.",
+          ]
+          Path("audit/pipa-dependency-audit.md").write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipa-uefi-dependency-audit
+          path: |
+            audit/
+          if-no-files-found: error
+          retention-days: 14
+ || true)
 
       - name: Audit dependencies and pipa build inputs (read-only)
         shell: bash
